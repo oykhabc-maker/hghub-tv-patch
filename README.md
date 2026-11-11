@@ -21,7 +21,7 @@ Fire TV 上改用原生 ExoPlayer 播放（繞過 Amazon WebView 有聲無影的
 ## 內容
 
 ```
-hghub-tv-tv31.diff     # 15 個檔案的源碼差異（可 git apply，不含 android-tv/）
+hghub-tv-tv31.diff     # 18 個檔案的源碼差異（可 git apply，不含 android-tv/）
 android-tv/            # 原生覆蓋層：gen/android 被 gitignore，需在 tauri init 後套用
   ├── MainActivity.kt  #   DPAD 橋接、允許帶聲自動播放、HGPlayer/HGEnv JS 介面
   ├── PlayerActivity.kt#   Fire TV 原生播放器（Media3/ExoPlayer）、每秒回報播放位置
@@ -92,6 +92,14 @@ apksigner sign --ks ~/.android/debug.keystore --ks-key-alias androiddebugkey \
 8. **遙控器切集不受開關影響**：`swipeEp`（上下划切集）原本只管手機手勢，但電視上下鍵
    誤用了同一條判斷，關掉開關時按上下鍵只會在背景列表捲動。tv31 起播放中的上下鍵
    一律先切集，沒有下一集才切上一／下一部劇。
+9. **歷史播放（tv31c）**：頁籤列拿掉後「我的 → 觀看歷史」很難到，於是拉成獨立頁
+   `src/pages/History.tsx`，入口在分類頁「排行榜」下面。一列一部（封面／第幾集／看到幾分幾秒／進度條），
+   點進去直接從上次位置續播，底部可清空（記錄只存本機 localStorage）。
+10. **每次進入 App 自動更新（tv31c）**：電視不會重載 WebView，`MainActivity.onResume`
+   在「不是從原生播放器回來」時呼叫 `window.__hgAppResume()`，首頁重抓第一頁並重新洗牌、
+   分類頻道預覽改抓 24 筆隨機挑 8 筆（伺服器第一頁固定不動）。正在播時跳過，不打斷播放。
+   順手修掉「電視一開機就自動跳進某一部劇」：看不見的頁面（`active=false`）不准開原生播放器，
+   而且電視的預設分頁在 store 初始化時就決定為「分類」。
 
 ## 遙控器操作
 
@@ -104,11 +112,13 @@ apksigner sign --ks ~/.android/debug.keystore --ks-key-alias androiddebugkey \
 | 返回 | 上一層；根頁連按兩下退出 |
 | 1 / 2 / 3 / 4 | 首頁 / 搜索 / 分類 / 我的（電視模式沒有頁籤列，靠這組鍵） |
 
+分類頁由上而下：排行榜 → **歷史播放** → 專題／標籤 → 各頻道預覽 → 黃果吃瓜。
+
 ## 驗證環境
 
 | 裝置 | 系統 | 結果 |
 | --- | --- | --- |
-| Fire TV Stick 4K Max (`AFTKA`) | Fire OS 9（armeabi-v7a） | tv31 實測：上下鍵切集、播完自動接下一集、最後一集播完自動關閉、跳出再進從上次位置續播 |
+| Fire TV Stick 4K Max (`AFTKA`) | Fire OS 9（armeabi-v7a） | tv31c 實測：開機停在分類不自動播、歷史播放 36 筆續播 `start=14.0s`、回前景 `[refresh]` 重抓、上下鍵切集、播完自動接下一集 |
 | Google TV Streamer | Android 14（32-bit userspace, armeabi-v7a） | 導覽／播放／切集／返回／帶聲全部實測通過（WebView 播放器路徑） |
 | Android TV 36 模擬器 | x86_64, 1920×1080 | 開發期逐項驗證（`--ez forceNative true` 可強制走原生播放器路徑） |
 

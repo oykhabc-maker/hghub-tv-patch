@@ -1,9 +1,9 @@
 diff --git a/TV-REMOTE.md b/TV-REMOTE.md
 new file mode 100644
-index 0000000..0f41ad1
+index 0000000..5a49fa0
 --- /dev/null
 +++ b/TV-REMOTE.md
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,152 @@
 +# HGhub TV（遙控器）改造說明
 +
 +這個 fork 只做一件事：讓 HGhub 在 Android TV / 電視盒上用**遙控器**操作。
@@ -122,6 +122,40 @@ index 0000000..0f41ad1
 +
 +**v1 限制**：原生播放器只播當前這一集；切集仍回 App 用上下鍵選。
 +要在播放器內切集，需要把整季的播放網址一起傳給原生端（多幾十個 API 請求），下一版再做。
++
++**tv31 補完**：上面那條已經做了，而且順手把「播完不會自動跳下一集」補上。
++
++## 原生播放器與 WebView 的狀態契約（tv31）
++
++電視上播放發生在 `PlayerActivity`（ExoPlayer），WebView 的 `<video>` 從頭到尾沒載入，
++所以「進度」「播完」「續播」都必須另外搭橋，否則前端永遠不知道播到哪：
++
++| 方向 | 介面 | 用途 |
++|---|---|---|
++| 原生 → JS | `window.__hgNativeTick(posMs, durMs, playing)`（每秒一次） | 寫觀看記錄、更新進度條 |
++| 原生 → JS | `window.__hgNativeEnded()` | 播完先問前端：有下一集就 `HGPlayer.load()` 原地換源，沒有才關閉 |
++| 原生 → JS | `window.__hgEpStep(±1)` | 上下鍵換集（前端算下一集） |
++| JS → 原生 | `HGPlayer.play(url, startMs)` / `load(url, label, startMs)` | `startMs` = 續播起點，原生端等 `STATE_READY` 才 seek |
++| JS → 原生 | `HGPlayer.close()` | 片尾沒有下一集時關掉播放器回列表 |
++
++另外：
++
++- `window.__hgAppResume()`：`MainActivity.onResume` 不是從原生播放器回來時呼叫，
++  前端據此重抓首頁／分類（電視不會重載 WebView，否則永遠是上次那一批片）。
++  正在播（`[data-tv-playing]`）時跳過，避免把正在看的片單換掉。
++- 看不見的頁面（`active=false`）不准開原生播放器：電視開機停在「分類」時，
++  背景仍掛著首頁，之前會一開機就自動跳進某一部劇。
++- 分類頁的頻道預覽改成抓 24 筆隨機挑 8 筆：伺服器第一頁固定不動，照原樣顯示就「每次都一樣」。
++
++## 歷史播放（tv31）
++
++電視版把頁籤列整個拿掉後，遙控器只剩數字鍵能切分頁，於是「我的 → 觀看歷史」變得很難到。
++`src/pages/History.tsx` 把它拉出來做成獨立頁，入口放在分類頁「排行榜」下面：
++
++- 一列一部：封面、標題、第幾集、看到幾分幾秒、進度條
++- 點進去直接 `startEp` + `startTime` 續播（片尾 10 秒內視為看完，從該集開頭播）
++- 底部可清空觀看記錄（只存在本機 localStorage，不上傳）
++
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
 index 78b9003..9447dbf 100644
 --- a/src-tauri/src/lib.rs
@@ -159,10 +193,23 @@ index 55c8f33..7db3dbd 100644
    }
  }
 diff --git a/src/App.tsx b/src/App.tsx
-index 392c887..65b2a2c 100644
+index 392c887..0779d2e 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -17,9 +17,11 @@ import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
+@@ -1,10 +1,11 @@
+ import { useEffect, useLayoutEffect, useRef, useState } from "react";
+ import { useStore, type Page, type Tab } from "./store";
+-import { isMobile, selfTest } from "./api";
++import { isMobile, logLine, selfTest } from "./api";
+ import { addPluginListener, invoke } from "@tauri-apps/api/core";
+ import { runBack } from "./back";
+ import Home from "./pages/Home";
+ import Search, { RankPage } from "./pages/Search";
++import HistoryPage from "./pages/History";
+ import Category, { ChannelPage } from "./pages/Category";
+ import Profile from "./pages/Profile";
+ import SettingsPage from "./pages/Settings";
+@@ -17,9 +18,11 @@ import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
  import ResizeHandles from "./components/ResizeHandles";
  import { tracePlayback } from "./playbackDiagnostics";
  import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF, Logo } from "./icons";
@@ -175,7 +222,7 @@ index 392c887..65b2a2c 100644
    const { tab, setTab, theme } = useStore();
    const items: { k: Tab; label: string }[] = [
      { k: "home", label: "首页" },
-@@ -32,13 +34,18 @@ function TabBar() {
+@@ -32,13 +35,18 @@ function TabBar() {
       浅色主题下底栏跟着换成浅色，深色主题保持深色。 */
    const overVideo = tab === "home";
    const lightBar = !overVideo && theme === "light";
@@ -198,7 +245,15 @@ index 392c887..65b2a2c 100644
        }}>
        <div className="h-[40px] flex items-center px-1">
          {items.map(({ k, label }) => {
-@@ -88,6 +95,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
+@@ -75,6 +83,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
+   }
+   if (page.kind === "channel") return <ChannelPage cate={page.cate} name={page.name} onBack={onBack} wide={wide} />;
+   if (page.kind === "ranks") return <RankPage onBack={onBack} wide={wide} />;
++  if (page.kind === "history") return <HistoryPage onBack={onBack} />;
+   if (page.kind === "settings") return <SettingsPage onBack={onBack} wide={wide} />;
+   if (page.kind === "posts") return <PostsPage onBack={onBack} wide={wide} />;
+   if (page.kind === "post") return <PostDetail id={page.id} onBack={onBack} active={top} />;
+@@ -88,6 +97,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
  /* ============ 应用主体 ============ */
  function AppBody() {
    const { platform, tab, setTab, stack, pop, loginOpen, setLoginOpen, fs, clean } = useStore();
@@ -206,7 +261,7 @@ index 392c887..65b2a2c 100644
    const mainRef = useRef<HTMLDivElement>(null);
    const [wide, setWide] = useState(!isMobile);
    const [collapsed, setCollapsed] = useState(false);
-@@ -122,7 +130,7 @@ function AppBody() {
+@@ -122,7 +132,7 @@ function AppBody() {
  
    const vis = (k: Tab) => (tab === k ? "absolute inset-0" : "absolute inset-0 invisible pointer-events-none");
    const pageActive = stack.length === 0 && !loginOpen;
@@ -215,7 +270,7 @@ index 392c887..65b2a2c 100644
    /* 栈页（从搜索/分类/我的进入的播放页、图文页）没有底栏，
       底部只让出安全区。之前多留了 20px，视频底边会露出一条
       「底栏」似的窄缝（底部的压暗渐变到不了屏幕最底）。 */
-@@ -138,12 +146,14 @@ function AppBody() {
+@@ -138,12 +148,14 @@ function AppBody() {
          <div className={vis("profile")}><Profile wide={wide} /></div>
  
          {stack.map((p, i) => (
@@ -232,7 +287,7 @@ index 392c887..65b2a2c 100644
        </div>
      </div>
    );
-@@ -209,7 +219,7 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+@@ -209,7 +221,7 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
          <div className={vis("category")}><Category wide={wide} active={pageActive && tab === "category"} /></div>
          <div className={vis("profile")}><Profile wide={wide} /></div>
          {stack.map((p, i) => (
@@ -241,7 +296,7 @@ index 392c887..65b2a2c 100644
              <StackPage page={p} onBack={pop} wide={wide} top={i === stack.length - 1} bottomInset={14} />
            </div>
          ))}
-@@ -220,6 +230,10 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+@@ -220,6 +232,10 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
  
  /* ============ 移动端（无壳） ============ */
  function MobileShell() {
@@ -252,16 +307,30 @@ index 392c887..65b2a2c 100644
    return (
      <div className="absolute inset-0 flex flex-col bg-canvas plat-android"
        style={{ "--sat": "max(env(safe-area-inset-top), 8px)", "--sab": "max(env(safe-area-inset-bottom), 6px)" } as React.CSSProperties}>
-@@ -232,7 +246,7 @@ function MobileShell() {
+@@ -232,7 +248,21 @@ function MobileShell() {
  
  /* ============ 入口 ============ */
  export default function App() {
 -  const { platform, loginOpen, setLoginOpen, tab, setTab, stack, pop, fs, setFs } = useStore();
-+  const { platform, loginOpen, setLoginOpen, tab, setTab, stack, pop, fs, setFs, toast } = useStore();
++  const { platform, loginOpen, setLoginOpen, tab, setTab, stack, pop, fs, setFs, toast, bumpRefresh } = useStore();
++  /* 回到前景（MainActivity.onResume，且不是從原生播放器回來）→ 重新抓最新內容。
++     正在播的時候不要動：那會把使用者正在看的片單換掉。 */
++  useEffect(() => {
++    const w = window as unknown as { __hgAppResume?: () => void };
++    w.__hgAppResume = () => {
++      if (document.querySelector("[data-tv-playing]")) {
++        logLine("[refresh] app resume — 正在播放，跳過更新");
++        return;
++      }
++      logLine("[refresh] app resume → 重抓首頁/分類最新內容");
++      bumpRefresh();
++    };
++    return () => { delete w.__hgAppResume; };
++  }, [bumpRefresh]);
    useEffect(() => {
      tracePlayback("navigation.change", { tab, stack: stack.map(p => ({ page: p.kind, key: p.key })), login_open: loginOpen });
    }, [tab, stack, loginOpen]);
-@@ -241,12 +255,27 @@ export default function App() {
+@@ -241,12 +271,27 @@ export default function App() {
       层级：全屏 → 面板/弹层 → 登录框 → 页面栈 → 回首页 → 退出应用。
       不注册这个监听，Tauri 会直接 webView.goBack() 或退出，表现就是「任意页面返回都回桌面」。 */
    const backRef = useRef<() => void>(() => {});
@@ -289,7 +358,7 @@ index 392c887..65b2a2c 100644
      if (tab !== "home") { setTab("home"); return; }
      invoke("plugin:app|exit", { code: 0 }).catch(() => {});
    };
-@@ -281,6 +310,7 @@ export default function App() {
+@@ -281,6 +326,7 @@ export default function App() {
    return (
      <>
        {isMobile ? <MobileShell /> : <DesktopShell />}
@@ -465,7 +534,7 @@ index 56225d1..25c8af9 100644
                      style={{ background: "rgba(12,15,22,.58)", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.09)" }}>
                      {episodes.length > 1 && (
 diff --git a/src/components/VideoSurface.tsx b/src/components/VideoSurface.tsx
-index a56578e..248ddbd 100644
+index a56578e..d04a2f6 100644
 --- a/src/components/VideoSurface.tsx
 +++ b/src/components/VideoSurface.tsx
 @@ -1,6 +1,8 @@
@@ -473,7 +542,7 @@ index a56578e..248ddbd 100644
  import Hls from "hls.js";
 -import { isLocalMedia, platform, playlist } from "../api";
 +import { isLocalMedia, logLine, platform, playlist } from "../api";
-+import { NATIVE_MEDIA_ORIGIN, nativePlayUrl, nativePlayerAvailable } from "../tv/bridge";
++import { NATIVE_MEDIA_ORIGIN, nativePlayUrl, nativePlayerAvailable, nativeSessionUrl } from "../tv/bridge";
 +import { tvOn } from "../tv/tvMode";
  import { mediaErrorMessage } from "../mediaErrors";
  import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
@@ -496,7 +565,7 @@ index a56578e..248ddbd 100644
      onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
    ref,
  ) {
-@@ -95,6 +99,18 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+@@ -95,6 +99,24 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
  
      const proxied = isLocalMedia(src);
      const url = proxied ? src : playlist(src);
@@ -504,6 +573,12 @@ index a56578e..248ddbd 100644
 +    /* Fire TV：Amazon WebView 的硬體解碼只出聲不出影（表面卡在 1 MB），
 +       電視版改由原生 ExoPlayer 播放同一個 HLS 代理網址。 */
 +    if (tvOn() && nativePlayerAvailable()) {
++      /* 看不見的頁面（例如電視開機停在分類時，背景仍掛著的首頁）不要偷開播放器：
++         之前一開機就自動跳進某一部劇，就是這條路徑造成的。 */
++      if (!active) {
++        logLine("[play] native skipped (page inactive)");
++        return;
++      }
 +      /* 原生播放器接不到 hg.localhost（Tauri 自定義協議），改走 loopback 代理 */
 +      const nativeUrl = url.startsWith(NATIVE_MEDIA_ORIGIN) ? url : url.replace(/^https?:\/\/[^/]+/, NATIVE_MEDIA_ORIGIN);
 +      logLine(`[play] native url=${nativeUrl.slice(0, 90)} start=${startAt.toFixed(1)}s`);
@@ -515,7 +590,32 @@ index a56578e..248ddbd 100644
      const useHls = !url.includes("/seg?u=");
      trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
  
-@@ -234,7 +250,59 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+@@ -182,12 +204,23 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [src]);
+ 
++  /* 頁面變成「看得見」時（遙控器切回首頁、棧頁回到最上層）才補開原生播放器：
++     否則電視開機會被背景的首頁自動拉進某一部劇。 */
++  useEffect(() => {
++    if (!active || !src || !tvOn() || !nativePlayerAvailable()) return;
++    const url = isLocalMedia(src) ? src : playlist(src);
++    const nativeUrl = url.startsWith(NATIVE_MEDIA_ORIGIN) ? url : url.replace(/^https?:\/\/[^/]+/, NATIVE_MEDIA_ORIGIN);
++    if (nativeSessionUrl() === nativeUrl) return;
++    logLine(`[play] native on-active url=${nativeUrl.slice(0, 90)} start=${startAt.toFixed(1)}s`);
++    nativePlayUrl(nativeUrl, startAt);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [active, src]);
++
+   // iOS 内联播放：部分 WKWebView 只认 HTML 属性
+   useEffect(() => {
+     const v = videoRef.current;
+     if (v) v.setAttribute("webkit-playsinline", "true");
+   }, []);
+-
+   useEffect(() => { if (videoRef.current) videoRef.current.muted = muted; }, [muted]);
+   useEffect(() => { if (videoRef.current) videoRef.current.volume = volume; }, [volume]);
+   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = rate; }, [rate]);
+@@ -234,7 +267,59 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
        onPlay={() => { if (activity.isActive()) onPlaying?.(); }}
        onPause={() => onPause?.()}
        onWaiting={() => onWaiting?.()}
@@ -671,6 +771,260 @@ index 9539ea9..803e8e1 100644
 +
 +/* 手機專用的浮動膠囊（切集/铺满/横屏）：電視上會壓在畫面中央，直接隱藏 */
 +html.tv-mode [data-tv-hide] { display: none !important; }
+diff --git a/src/pages/Category.tsx b/src/pages/Category.tsx
+index 01c64b9..b4b3358 100644
+--- a/src/pages/Category.tsx
++++ b/src/pages/Category.tsx
+@@ -4,7 +4,7 @@ import type { Post, VideoCard } from "../types";
+ import { useStore } from "../store";
+ import { Masonry, RowCard } from "../components/cards";
+ import { Empty, Img } from "../components/ui";
+-import { IBack, IChevR, IGlobe, IGrid, ITrophy } from "../icons";
++import { IBack, IChevR, IGlobe, IGrid, IHist, ITrophy } from "../icons";
+ 
+ export const CHANNELS = [
+   { cate: "ai-duanju", name: "AI成人短剧", desc: "高能反转 · 一口气看完" },
+@@ -13,9 +13,20 @@ export const CHANNELS = [
+   { cate: "ai-mogai", name: "AI魔改", desc: "魔改名场面 · 脑洞大开" },
+ ] as const;
+ 
++/* 從較大的清單隨機挑 n 個：讓每次開 App 的頻道預覽都不一樣 */
++function pickSome<T>(arr: T[], n: number): T[] {
++  if (arr.length <= n) return arr;
++  const a = [...arr];
++  for (let i = a.length - 1; i > 0; i--) {
++    const j = Math.floor(Math.random() * (i + 1));
++    [a[i], a[j]] = [a[j], a[i]];
++  }
++  return a.slice(0, n);
++}
++
+ /* ================= 分类总览 ================= */
+ export default function Category({ wide, active }: { wide: boolean; active: boolean }) {
+-  const { push } = useStore();
++  const { push, history, refreshEpoch } = useStore();
+   const [rows, setRows] = useState<Record<string, VideoCard[]>>({});
+   const [posts, setPosts] = useState<Post[]>([]);
+   const [loading, setLoading] = useState<Record<string, boolean>>({});
+@@ -39,8 +50,10 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
+         const result = await api.posts(1, 8);
+         if (mounted.current) setPosts(result?.items || []);
+       } else {
+-        const result = await api.category(key, 1, 8);
+-        if (mounted.current) setRows(m => ({ ...m, [key]: result?.items || [] }));
++        /* 一次抓 24 個再隨機挑 8 個：伺服器的第一頁往往固定不動，
++           照原樣顯示就會「每次開 App 都同一批」。隨機挑選讓預覽每次都換。 */
++        const result = await api.category(key, 1, 24);
++        if (mounted.current) setRows(m => ({ ...m, [key]: pickSome(result?.items || [], 8) }));
+       }
+     } catch (error) {
+       if (mounted.current) setErrors(m => ({ ...m, [key]: (error as Error).message || "加载失败" }));
+@@ -58,6 +71,17 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
+     void loadPreview("posts");
+   }, [active, loadPreview]);
+ 
++  /* 重新進入 App：即使這一輪已經載入過，也再抓一次頻道預覽，讓內容換成最新的。 */
++  const epochRef = useRef(refreshEpoch);
++  useEffect(() => {
++    if (epochRef.current === refreshEpoch) return;
++    epochRef.current = refreshEpoch;
++    if (!active) return;
++    started.current = true;
++    CHANNELS.forEach((c) => { void loadPreview(c.cate); });
++    void loadPreview("posts");
++  }, [refreshEpoch, active, loadPreview]);
++
+   return (
+     <div className="absolute inset-0 bg-bg flex flex-col">
+       <div className="shrink-0 px-4 pb-1" style={{ paddingTop: "calc(var(--sat, 0px) + 14px)" }}>
+@@ -79,6 +103,19 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
+           <IChevR size={16} className="text-mut" />
+         </button>
+ 
++        {/* 歷史播放入口：電視模式沒有頁籤列，這裡是遙控器最短路徑 */}
++        <button onClick={() => push({ kind: "history" })}
++          className="mx-4 mb-2.5 w-[calc(100%-2rem)] flex items-center gap-3 rounded-(--r-md) bg-s2 p-3.5 text-left pressable elev-1">
++          <span className="w-10 h-10 rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center shrink-0"><IHist size={20} /></span>
++          <span className="flex-1">
++            <span className="block text-[14.5px] font-semibold text-on">歷史播放</span>
++            <span className="block text-[10.5px] text-mut mt-0.5">
++              {history.length ? `接著上次看到的地方 · ${history.length} 條記錄` : "看過的劇集會出現在這裡"}
++            </span>
++          </span>
++          <IChevR size={16} className="text-mut" />
++        </button>
++
+         {/* 专题 + 标签入口 */}
+         <div className="mx-4 mb-5 grid grid-cols-2 gap-2.5">
+           <button onClick={() => push({ kind: "topics" })}
+diff --git a/src/pages/History.tsx b/src/pages/History.tsx
+new file mode 100755
+index 0000000..531f145
+--- /dev/null
++++ b/src/pages/History.tsx
+@@ -0,0 +1,118 @@
++import { useEffect, useState } from "react";
++import { api, cover } from "../api";
++import type { Detail } from "../types";
++import { useStore } from "../store";
++import { Empty, Img } from "../components/ui";
++import { IBack, IChevR, IHist, ITrash } from "../icons";
++
++/** 秒 → m:ss */
++function clock(sec: number) {
++  const s = Math.max(0, Math.floor(sec || 0));
++  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
++}
++
++/* 歷史播放：本機觀看記錄（store.history）的專用清單。
++   電視模式沒有頁籤列，原本只有「我的 → 觀看歷史」進得去，
++   這裡拉出來給遙控器直接看：一列一部、封面＋集數＋進度，點進去接著播。
++   記錄只存在本機（localStorage），不上傳。 */
++export default function HistoryPage({ onBack }: { onBack: () => void }) {
++  const { history, push, clearHistory, toast } = useStore();
++  const [details, setDetails] = useState<Record<number, Detail>>({});
++  const [loading, setLoading] = useState(false);
++  const ids = history.map((h) => h.id);
++
++  useEffect(() => {
++    let alive = true;
++    const missing = ids.filter((id) => !details[id]);
++    if (!missing.length) { setLoading(false); return undefined; }
++    setLoading(true);
++    Promise.allSettled(missing.map((id) => api.video(id)))
++      .then((rs) => {
++        if (!alive) return;
++        setDetails((m) => {
++          const next = { ...m };
++          rs.forEach((r, i) => {
++            if (r.status === "fulfilled") next[missing[i]] = (r as PromiseFulfilledResult<Detail>).value;
++          });
++          return next;
++        });
++      })
++      .finally(() => { if (alive) setLoading(false); });
++    return () => { alive = false; };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [ids.join(",")]);
++
++  return (
++    <div className="absolute inset-0 bg-bg flex flex-col">
++      <div className="shrink-0 px-3 pt-2 pb-3" style={{ paddingTop: "calc(var(--sat, 0px) + 8px)" }}>
++        <div className="flex items-center gap-2">
++          <button onClick={onBack} aria-label="返回"
++            className="w-10 h-10 rounded-full flex items-center justify-center text-on pressable">
++            <IBack size={20} />
++          </button>
++          <span className="w-9 h-9 rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center shrink-0">
++            <IHist size={19} />
++          </span>
++          <div className="flex-1 min-w-0">
++            <div className="text-[20px] font-bold text-on leading-none">歷史播放</div>
++            <div className="text-[10.5px] text-mut mt-1">接著上次看到的地方 · {history.length} 條記錄</div>
++          </div>
++        </div>
++      </div>
++
++      <div className="flex-1 scroll-y px-3 pb-10">
++        {loading && !ids.length ? (
++          <div className="flex justify-center py-12"><div className="w-8 h-8 spinner" /></div>
++        ) : ids.length ? (
++          <div className="flex flex-col gap-2">
++            {history.map((h, i) => {
++              const d = details[h.id];
++              const pct = h.dur > 0 ? Math.max(0, Math.min(100, (h.t / h.dur) * 100)) : 0;
++              const finished = h.dur > 0 && h.t >= h.dur - 10;
++              return (
++                <button key={`${h.id}-${h.at}`}
++                  onClick={() => push({
++                    kind: "feed", videoIds: ids, index: i, title: "歷史播放",
++                    startEp: h.ep, startTime: finished ? undefined : h.t,
++                  })}
++                  className="w-full flex items-center gap-3 p-2.5 rounded-(--r-md) bg-s1 elev-1 pressable text-left">
++                  <div className="relative w-[118px] shrink-0 rounded-(--r-sm) overflow-hidden bg-s2" style={{ aspectRatio: "16 / 9" }}>
++                    <Img src={d?.cover ? cover(d.cover, 320) : ""} />
++                    <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-black/72 text-[9.5px] leading-none text-white/92">
++                      {clock(h.t)}{h.dur > 0 ? ` / ${clock(h.dur)}` : ""}
++                    </span>
++                  </div>
++                  <div className="flex-1 min-w-0">
++                    <div className="text-[14px] font-semibold text-on truncate">{d?.title || `視頻 ${h.id}`}</div>
++                    <div className="text-[10.5px] text-mut mt-1">
++                      第 {h.ep} 集{finished ? " · 已看完" : h.t > 3 ? ` · 看到 ${clock(h.t)}` : " · 剛開始"}
++                    </div>
++                    {h.dur > 0 && (
++                      <div className="mt-2 h-[3px] rounded-full bg-s3 overflow-hidden">
++                        <div className="h-full" style={{ width: `${pct}%`, background: "var(--p-primary)" }} />
++                      </div>
++                    )}
++                  </div>
++                  <IChevR size={16} className="text-mut shrink-0" />
++                </button>
++              );
++            })}
++          </div>
++        ) : (
++          <Empty icon={<IHist size={24} />} title="還沒有觀看記錄"
++            sub="看過的劇集會出現在這裡，點一下就從上次的位置接著播"
++            action="去逛逛" onAction={() => push({ kind: "ranks" })} />
++        )}
++
++        {ids.length > 0 && (
++          <button
++            onClick={() => { clearHistory(); toast("已清空觀看記錄", "ok"); }}
++            className="mt-4 w-full h-10 rounded-(--r-ctl) bg-s3 text-[12.5px] text-mut pressable flex items-center justify-center gap-1.5">
++            <ITrash size={15} />
++            清空觀看記錄
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/pages/Home.tsx b/src/pages/Home.tsx
+index c97c288..cc84e44 100644
+--- a/src/pages/Home.tsx
++++ b/src/pages/Home.tsx
+@@ -17,7 +17,7 @@ function shuffle<T>(arr: T[]): T[] {
+ }
+ 
+ export default function Home({ active, bottomInset }: { active: boolean; bottomInset: number }) {
+-  const { toast } = useStore();
++  const { toast, refreshEpoch } = useStore();
+   const [items, setItems] = useState<VideoCard[]>([]);
+   const [page, setPage] = useState(1);
+   const [loading, setLoading] = useState(false);
+@@ -52,6 +52,30 @@ export default function Home({ active, bottomInset }: { active: boolean; bottomI
+ 
+   useEffect(() => { if (!items.length) load(1); /* eslint-disable-next-line */ }, []);
+ 
++  /* 每次重新進入 App（refreshEpoch +1）就重抓第一頁並重新洗牌：
++     電視常駐在背景，WebView 不會重載，沒有這條的話內容永遠是同一天那一批。 */
++  const epochRef = useRef(refreshEpoch);
++  useEffect(() => {
++    if (epochRef.current === refreshEpoch) return;
++    epochRef.current = refreshEpoch;
++    let alive = true;
++    loadingRef.current = false;
++    setError("");
++    (async () => {
++      try {
++        const res = await api.feed(1, 30);
++        if (!alive) return;
++        const list = res?.items || [];
++        setItems(shuffle(list));
++        setPage(1);
++        setDone(!list.length || !!(res?.pagination && 1 >= res.pagination.pages));
++      } catch {
++        /* 抓不到就保留舊片單，不要把畫面清空 */
++      }
++    })();
++    return () => { alive = false; };
++  }, [refreshEpoch]);
++
+   const ids = items.map((v) => v.id);
+ 
+   return (
 diff --git a/src/pages/Settings.tsx b/src/pages/Settings.tsx
 index 8c99974..70f8b98 100644
 --- a/src/pages/Settings.tsx
@@ -718,10 +1072,34 @@ index 8c99974..70f8b98 100644
                <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
              </div>
 diff --git a/src/store.tsx b/src/store.tsx
-index db2b755..3c2421b 100644
+index db2b755..3d750ef 100644
 --- a/src/store.tsx
 +++ b/src/store.tsx
-@@ -72,7 +72,7 @@ type Persist = {
+@@ -2,6 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
+ import { api, platform as envPlatform } from "./api";
+ import { isStrictSecurity, setStrictSecurity as setHtmlStrictSecurity } from "./html";
+ import type { User } from "./types";
++import { tvOn } from "./tv/tvMode";
+ 
+ export type Platform = "android" | "ios" | "windows" | "macos" | "linux";
+ export type Theme = "dark" | "light";
+@@ -25,6 +26,7 @@ export type Page =
+   | FeedContext
+   | { kind: "channel"; key: string; cate: string; name: string }
+   | { kind: "ranks"; key: string }
++  | { kind: "history"; key: string }
+   | { kind: "settings"; key: string }
+   | { kind: "posts"; key: string }
+   | { kind: "post"; key: string; id: number }
+@@ -37,6 +39,7 @@ export type PageInput =
+   | { kind: "feed"; videoIds: number[]; index: number; title: string; source?: string; feedKind?: "video" | "post"; startEp?: number; startTime?: number }
+   | { kind: "channel"; cate: string; name: string }
+   | { kind: "ranks" }
++  | { kind: "history" }
+   | { kind: "settings" }
+   | { kind: "posts" }
+   | { kind: "post"; id: number }
+@@ -72,7 +75,7 @@ type Persist = {
  const LS = "hghub_app_v1";
  const DEFAULTS: Persist = {
    likes: [], favs: [], history: [], follows: [],
@@ -730,7 +1108,7 @@ index db2b755..3c2421b 100644
  };
  
  /** 旧版本 history 是 number[]，读出来时升级成带进度的结构 */
-@@ -97,8 +97,17 @@ function loadPersist(): Persist {
+@@ -97,8 +100,17 @@ function loadPersist(): Persist {
      const raw = localStorage.getItem(LS);
      if (!raw) return DEFAULTS;
      const p = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Persist>) };
@@ -750,7 +1128,7 @@ index db2b755..3c2421b 100644
      /* 1.2.9 起上下划默认就是切集。老配置里 swipeEp 存的 false 是当年的默认值，
         不是用户主动关的，所以这里做一次性迁移；用户之后自己关掉不会再被改回来。 */
      let swipeEp = p.swipeEp !== false;
-@@ -108,7 +117,8 @@ function loadPersist(): Persist {
+@@ -108,7 +120,8 @@ function loadPersist(): Persist {
          localStorage.setItem("hghub_swipe_ep_v2", "1");
        }
      } catch { /* ignore */ }
@@ -760,7 +1138,35 @@ index db2b755..3c2421b 100644
    } catch {
      return DEFAULTS;
    }
-@@ -263,8 +273,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+@@ -156,6 +169,9 @@ type Store = {
+   toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"]) => void;
+   /** 线路切换计数：变了就让列表页重挂载，重新拉一遍数据 */
+   lineEpoch: number;
++  /** 回到前景计数：每次重新進入 App 就 +1，讓首頁/分類重新抓最新內容 */
++  refreshEpoch: number;
++  bumpRefresh: () => void;
+ };
+ 
+ const Ctx = createContext<Store>(null as unknown as Store);
+@@ -165,12 +181,16 @@ let seq = 0;
+ export function AppProvider({ children }: { children: React.ReactNode }) {
+   const [p, setP] = useState<Persist>(loadPersist);
+   const [theme, setThemeState] = useState<Theme>(readTheme);
+-  const [tab, setTabRaw] = useState<Tab>("home");
++  /* 電視開機直接停在「分類」：首頁是全螢幕自動播放的短劇流，
++     若等 effect 再切分頁，Home 會先掛載並自動播一部（使用者根本沒選片）。 */
++  const [tab, setTabRaw] = useState<Tab>(() => (tvOn() ? "category" : "home"));
+   const [stack, setStack] = useState<Page[]>([]);
+   const [user, setUser] = useState<User | null>(null);
+   const [loginOpen, setLoginOpen] = useState(false);
+   const [toasts, setToasts] = useState<Toast[]>([]);
+   const [lineEpoch, setLineEpoch] = useState(0);
++  const [refreshEpoch, setRefreshEpoch] = useState(0);
++  const bumpRefresh = useCallback(() => setRefreshEpoch((n) => n + 1), []);
+   const [theater, setTheaterState] = useState(false);
+   const [fs, setFsState] = useState(false);
+   const [clean, setCleanState] = useState(false);
+@@ -263,8 +283,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
    }, []);
  
    const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); }, []);
@@ -785,6 +1191,19 @@ index db2b755..3c2421b 100644
    }, []);
    const pop = useCallback(() => setStack((s) => s.slice(0, -1)), []);
  
+@@ -364,10 +399,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+     searchHist: p.searchHist, addSearch, clearSearchHist,
+     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+     toasts, toast, lineEpoch,
++    refreshEpoch, bumpRefresh,
+   }), [theme, tab, setTab, stack, push, pop, user, loginOpen, logout,
+     p, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
+     setMuted, setMuteOnStartup, setSwipeEp, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+-    toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean]);
++    toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean, refreshEpoch, bumpRefresh]);
+ 
+   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+ }
 diff --git a/src/tv/TvMode.tsx b/src/tv/TvMode.tsx
 new file mode 100644
 index 0000000..057011c
@@ -887,10 +1306,10 @@ index 0000000..057011c
 +}
 diff --git a/src/tv/bridge.ts b/src/tv/bridge.ts
 new file mode 100644
-index 0000000..f1f9216
+index 0000000..224ad29
 --- /dev/null
 +++ b/src/tv/bridge.ts
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,113 @@
 +/* ============================================================
 +   遙控器原生橋接
 +   ------------------------------------------------------------
@@ -950,6 +1369,12 @@ index 0000000..f1f9216
 +/** 原生播放器是否已經開著（開著就一直用 load 原地換集，不要疊第二個 Activity） */
 +let launched = false;
 +let epLabel = "";
++/** 最後送給原生播放器的網址：頁面「變成看得見」時用它判斷要不要補開播放器 */
++let lastUrl = "";
++
++export function nativeSessionUrl(): string {
++  return lastUrl;
++}
 +
 +/** 播放器上要顯示的集數標籤（原生播放器用 Toast 顯示） */
 +export function setNativeLabel(label: string) {
@@ -959,6 +1384,7 @@ index 0000000..f1f9216
 +/** 原生播放器關掉後由 MainActivity 標記，避免重複 startActivity */
 +export function nativeClosed() {
 +  launched = false;
++  lastUrl = "";
 +}
 +
 +/**
@@ -975,6 +1401,7 @@ index 0000000..f1f9216
 +      b.play(url, startMs);
 +      launched = true;
 +    }
++    lastUrl = url;
 +    return true;
 +  } catch {
 +    return false;
