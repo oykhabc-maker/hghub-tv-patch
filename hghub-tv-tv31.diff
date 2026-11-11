@@ -1,9 +1,9 @@
 diff --git a/TV-REMOTE.md b/TV-REMOTE.md
 new file mode 100644
-index 0000000..6d9ada0
+index 0000000..0f41ad1
 --- /dev/null
 +++ b/TV-REMOTE.md
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,118 @@
 +# HGhub TV（遙控器）改造說明
 +
 +這個 fork 只做一件事：讓 HGhub 在 Android TV / 電視盒上用**遙控器**操作。
@@ -92,6 +92,59 @@ index 0000000..6d9ada0
 +  新增的 `src/tv/` 不會衝突。
 +- 授權是 PolyForm Noncommercial 1.0.0：自用/修改可以，不得商業化散布。
 +- 播放源與接口都由上游維護；上游若改接口，這個 fork 只跟上游同步即可。
++
++## 原生播放器（Fire TV 有聲無影的解方）
++
++**症狀**：Fire TV Stick 4K Max（Fire OS 9 / Amazon WebView 138）播放時有聲音、沒有畫面。
++
++**證據**（`adb logcat`）：
++```
++create MediaCodec video decoder, mime video/avc, decoder name OMX.MTK.VIDEO.DECODER.AVC
++E/ACodec: failed to set min buffer size to 6220800 (is still 1048576)
++W/chromium: Video renderer video frame queue is empty → TransitionToHaveNothing
++```
++用 `requestVideoFrameCallback` 探針確認：**影像幀其實有解出來**（4 秒 90 幀、1280x720、readyState=4、
++圖層可見且沒被任何元素蓋住），但 AWV 把解碼表面卡在 1 MB，送不上螢幕。
++同一份程式碼在 Android TV 模擬器（x86_64）與 Google TV Streamer 上畫面正常，
++所以這是 Amazon WebView 的硬體解碼缺陷，不是應用層程式碼問題。
++
++**做法**：電視版新增 `PlayerActivity`（Media3 / ExoPlayer），播放時改走系統解碼路徑：
++
++- 前端在 `VideoSurface` 偵測 `nativePlayerAvailable()`（UA 含 `AmazonWebView` / `AFT….`）後，
++  不再自己 attach hls.js，而是呼叫 `window.HGPlayer.play(url)`。
++- 網址沿用 Rust 的 loopback HLS 代理 `http://127.0.0.1:17650/hls?u=…`
++  （`src-tauri/src/linux_http.rs` 原本只給 Linux 用，Android 也一起啟用）——
++  Tauri 的自定義協議 `hg.localhost` 只有 WebView 認得，原生播放器拿不到。
++- `AndroidManifest.xml` 需要 `networkSecurityConfig` 放行 `localhost/127.0.0.1` 的明文
++  （Android 9+ 預設擋，ExoPlayer 會報 `Cleartext HTTP traffic … not permitted`）。
++- 遙控器：OK 叫出控制列、左右 ±10 秒、播放/暫停鍵切換、返回先收控制列再按一次離開。
++  離開後 `MainActivity.onResume` 會叫前端模擬一次 `Escape`，回到原本那一頁。
++
++**v1 限制**：原生播放器只播當前這一集；切集仍回 App 用上下鍵選。
++要在播放器內切集，需要把整季的播放網址一起傳給原生端（多幾十個 API 請求），下一版再做。
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 78b9003..9447dbf 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1,6 +1,6 @@
+ mod api;
+ mod lines;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux_http;
+ mod logging;
+ #[cfg(target_os = "macos")]
+@@ -65,7 +65,9 @@ pub fn run() {
+             }
+             // Linux 的 <video> 由 GStreamer 播放，它只认常规 HTTP scheme；
+             // 这里起一个 loopback 代理，前端与 m3u8 改写都指向它（见 linux_http.rs）
+-            #[cfg(target_os = "linux")]
++            // Linux 的 <video> 由 GStreamer 播放；Android 的電視版原生播放器（ExoPlayer）
++            // 也接不到 Tauri 的自定義協議，兩邊都需要一個真正的 loopback HTTP 代理。
++            #[cfg(any(target_os = "linux", target_os = "android"))]
+             linux_http::start();
+             // macOS 主窗口在此创建：先按系统红绿灯尺寸算出居中位置（见 macos_titlebar.rs）
+             #[cfg(target_os = "macos")]
 diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
 index 55c8f33..7db3dbd 100644
 --- a/src-tauri/tauri.conf.json
@@ -106,10 +159,10 @@ index 55c8f33..7db3dbd 100644
    }
  }
 diff --git a/src/App.tsx b/src/App.tsx
-index 392c887..05ee85d 100644
+index 392c887..65b2a2c 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -17,6 +17,8 @@ import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
+@@ -17,9 +17,11 @@ import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
  import ResizeHandles from "./components/ResizeHandles";
  import { tracePlayback } from "./playbackDiagnostics";
  import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF, Logo } from "./icons";
@@ -117,8 +170,35 @@ index 392c887..05ee85d 100644
 +import { tvOn } from "./tv/tvMode";
  
  /* ============ 底部标签栏（Android）—— 细瘦纯文字、低侵入 ============ */
- function TabBar() {
-@@ -88,6 +90,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
+-function TabBar() {
++function TabBar({ placement = "bottom" }: { placement?: "top" | "bottom" } = {}) {
+   const { tab, setTab, theme } = useStore();
+   const items: { k: Tab; label: string }[] = [
+     { k: "home", label: "首页" },
+@@ -32,13 +34,18 @@ function TabBar() {
+      浅色主题下底栏跟着换成浅色，深色主题保持深色。 */
+   const overVideo = tab === "home";
+   const lightBar = !overVideo && theme === "light";
++  const top = placement === "top";
+   return (
+-    <nav className="hg-tabbar absolute bottom-0 inset-x-0 z-30"
++    <nav data-tv-nav="1"
++      className={top ? "hg-tabbar shrink-0 relative z-30" : "hg-tabbar absolute bottom-0 inset-x-0 z-30"}
+       style={{
+-        paddingBottom: "var(--sab, 0px)",
++        paddingTop: top ? "var(--sat, 8px)" : undefined,
++        paddingBottom: top ? 0 : "var(--sab, 0px)",
+         background: lightBar ? "rgba(250, 250, 250, .97)" : overVideo ? "#000000" : "#141414",
+-        borderTop: lightBar ? "1px solid rgba(0,0,0,.08)" : overVideo ? "none" : "1px solid rgba(255,255,255,.07)",
+-        boxShadow: lightBar ? "0 -2px 14px rgba(0,0,0,.05)" : "none",
++        borderTop: top ? "none" : lightBar ? "1px solid rgba(0,0,0,.08)" : overVideo ? "none" : "1px solid rgba(255,255,255,.07)",
++        borderBottom: top ? (lightBar ? "1px solid rgba(0,0,0,.08)" : "1px solid rgba(255,255,255,.10)") : "none",
++        boxShadow: top ? (lightBar ? "0 2px 14px rgba(0,0,0,.06)" : "0 2px 16px rgba(0,0,0,.35)")
++          : lightBar ? "0 -2px 14px rgba(0,0,0,.05)" : "none",
+       }}>
+       <div className="h-[40px] flex items-center px-1">
+         {items.map(({ k, label }) => {
+@@ -88,6 +95,7 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
  /* ============ 应用主体 ============ */
  function AppBody() {
    const { platform, tab, setTab, stack, pop, loginOpen, setLoginOpen, fs, clean } = useStore();
@@ -126,16 +206,16 @@ index 392c887..05ee85d 100644
    const mainRef = useRef<HTMLDivElement>(null);
    const [wide, setWide] = useState(!isMobile);
    const [collapsed, setCollapsed] = useState(false);
-@@ -122,7 +125,7 @@ function AppBody() {
+@@ -122,7 +130,7 @@ function AppBody() {
  
    const vis = (k: Tab) => (tab === k ? "absolute inset-0" : "absolute inset-0 invisible pointer-events-none");
    const pageActive = stack.length === 0 && !loginOpen;
 -  const bottomInset = isMobile ? (fs || clean ? 0 : 40) : 14;
-+  const bottomInset = isMobile ? (fs || clean ? 0 : (tv ? 68 : 40)) : 14;
++  const bottomInset = isMobile ? (fs || clean || tv ? 0 : 40) : 14;
    /* 栈页（从搜索/分类/我的进入的播放页、图文页）没有底栏，
       底部只让出安全区。之前多留了 20px，视频底边会露出一条
       「底栏」似的窄缝（底部的压暗渐变到不了屏幕最底）。 */
-@@ -138,7 +141,7 @@ function AppBody() {
+@@ -138,12 +146,14 @@ function AppBody() {
          <div className={vis("profile")}><Profile wide={wide} /></div>
  
          {stack.map((p, i) => (
@@ -144,7 +224,35 @@ index 392c887..05ee85d 100644
              <StackPage page={p} onBack={pop} wide={wide} top={i === stack.length - 1} bottomInset={stackInset} />
            </div>
          ))}
-@@ -232,7 +235,7 @@ function MobileShell() {
+ 
+-        {isMobile && !fs && !clean && stack.length === 0 && <TabBar />}
++        {/* 電視模式的頁籤列在 MobileShell 最上方，底欄一律不再渲染，
++            否則畫面上緣與下緣會各出現一條同名頁籤（tv29 的 bug）。 */}
++        {isMobile && !tv && !fs && !clean && stack.length === 0 && <TabBar />}
+       </div>
+     </div>
+   );
+@@ -209,7 +219,7 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+         <div className={vis("category")}><Category wide={wide} active={pageActive && tab === "category"} /></div>
+         <div className={vis("profile")}><Profile wide={wide} /></div>
+         {stack.map((p, i) => (
+-          <div key={p.key} className="absolute inset-0 z-30 bg-bg win-page-in" style={{ boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }}>
++          <div key={p.key} data-tv-page="1" className="absolute inset-0 z-30 bg-bg win-page-in" style={{ boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }}>
+             <StackPage page={p} onBack={pop} wide={wide} top={i === stack.length - 1} bottomInset={14} />
+           </div>
+         ))}
+@@ -220,6 +230,10 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
+ 
+ /* ============ 移动端（无壳） ============ */
+ function MobileShell() {
++  const { stack, fs, clean } = useStore();
++  /* 電視模式：整個 App 不畫頁籤列（上下都不畫）。
++     切分頁靠遙控器數字鍵 1-4（首頁/搜索/分類/我的）與返回鍵，
++     播放畫面因此可以真正滿版。 */
+   return (
+     <div className="absolute inset-0 flex flex-col bg-canvas plat-android"
+       style={{ "--sat": "max(env(safe-area-inset-top), 8px)", "--sab": "max(env(safe-area-inset-bottom), 6px)" } as React.CSSProperties}>
+@@ -232,7 +246,7 @@ function MobileShell() {
  
  /* ============ 入口 ============ */
  export default function App() {
@@ -153,7 +261,7 @@ index 392c887..05ee85d 100644
    useEffect(() => {
      tracePlayback("navigation.change", { tab, stack: stack.map(p => ({ page: p.kind, key: p.key })), login_open: loginOpen });
    }, [tab, stack, loginOpen]);
-@@ -241,12 +244,27 @@ export default function App() {
+@@ -241,12 +255,27 @@ export default function App() {
       层级：全屏 → 面板/弹层 → 登录框 → 页面栈 → 回首页 → 退出应用。
       不注册这个监听，Tauri 会直接 webView.goBack() 或退出，表现就是「任意页面返回都回桌面」。 */
    const backRef = useRef<() => void>(() => {});
@@ -181,7 +289,7 @@ index 392c887..05ee85d 100644
      if (tab !== "home") { setTab("home"); return; }
      invoke("plugin:app|exit", { code: 0 }).catch(() => {});
    };
-@@ -281,6 +299,7 @@ export default function App() {
+@@ -281,6 +310,7 @@ export default function App() {
    return (
      <>
        {isMobile ? <MobileShell /> : <DesktopShell />}
@@ -189,11 +297,130 @@ index 392c887..05ee85d 100644
        <LoginModal />
        <ToastHost />
        {/* 登录遮罩键盘处理占位 */}
+diff --git a/src/api.ts b/src/api.ts
+index fcb65d6..6996491 100644
+--- a/src/api.ts
++++ b/src/api.ts
+@@ -52,7 +52,14 @@ export const playlist = (url: string) => `${LOCAL}/hls?u=${encodeURIComponent(ur
+ /* ── 调用封装 ───────────────────────────────────────────── */
+ 
+ /** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它） */
+-export const logLine = (msg: string) => invoke("debug_log", { msg }).catch(() => {});
++export const logLine = (msg: string) => {
++  /* 電視盒（release 版）讀不到 app 私有目錄；原生端有掛 HGLog 時同步丟到 logcat */
++  try {
++    const bridge = (window as unknown as { HGLog?: { log: (m: string) => void } }).HGLog;
++    bridge?.log(msg);
++  } catch { /* ignore */ }
++  invoke("debug_log", { msg }).catch(() => {});
++};
+ 
+ /** 网络类失败的样子：没有 HTTP 状态码，纯链路层（DNS / 连接 / 超时 / TLS） */
+ const NET_FAIL = /dns|timed? ?out|timeout|connection|refused|reset|unreachable|broken pipe|tls|ssl|handshake|证书|网络|连接/i;
 diff --git a/src/components/Feed.tsx b/src/components/Feed.tsx
-index 56225d1..a5d5e2e 100644
+index 56225d1..25c8af9 100644
 --- a/src/components/Feed.tsx
 +++ b/src/components/Feed.tsx
-@@ -382,6 +382,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+@@ -9,6 +9,7 @@ import PlayerControls from "./PlayerControls";
+ import PlaybackLock from "./PlaybackLock";
+ import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
+ import { setBackHandler } from "../back";
++import { nativeClose, setNativeLabel } from "../tv/bridge";
+ import { tracePlayback } from "../playbackDiagnostics";
+ import {
+   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
+@@ -233,6 +234,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+     const next = Math.max(0, Math.min(videoIds.length - 1, index + delta));
+     el.scrollTo({ top: next * el.clientHeight, behavior: "smooth" });
+   }, [index, videoIds.length]);
++  const goRef = useRef(go);
++  goRef.current = go;
+ 
+   /* 统一的上下切换：swipeEp 开启且为多集视频时优先切集，否则切剧。
+      桌面端键盘 ↑↓ 与右侧按钮都走这里，和移动端上下划手势保持一致。 */
+@@ -250,6 +253,81 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+     go(dir);
+   }, [swipeEp, kind, epMap, curId, episodes.length, go]);
+ 
++  /* 原生播放器（Fire TV）的每秒回報：位置/總長/是否在播。
++     電視上播放由原生 ExoPlayer 負責，WebView 的 <video> 根本沒載入，
++     所以「進度」「續播」必須靠這條回報，否則觀看記錄永遠是 0。 */
++  const durRef = useRef(duration);
++  durRef.current = duration;
++  const saveNativeProgress = (id: number, ep: number, t: number, d: number) => {
++    if (!id) return;
++    liveRef.current = { id, ep, dur: d || liveRef.current.dur, t };
++    const now = Date.now();
++    if (d > 0 && now - lastSaveRef.current > 5000) {
++      lastSaveRef.current = now;
++      addHistory(id, ep, t, d);
++    }
++  };
++
++  /* 原生播放器（Fire TV）的上下鍵：由前端算下一集，原生端只負責回報按鍵。
++     電視上不論「上下划切集」開關為何，一律先切集 —— 遙控器上下鍵在播放器裡
++     就是要換集；按了沒反應才是 bug（tv30「播到後面按不下去」）。
++     沒有下一集才退回切上一/下一部劇。 */
++  const navRef = useRef({ id: curId, ep: curEp, total: episodes.length, episodes, kind });
++  navRef.current = { id: curId, ep: curEp, total: episodes.length, episodes, kind };
++
++  useEffect(() => {
++    const w = window as unknown as {
++      __hgEpStep?: (dir: number) => void;
++      __hgNativeTick?: (posMs: number, durMs: number, playing: number) => void;
++      __hgNativeEnded?: () => void;
++    };
++    w.__hgEpStep = (dir: number) => {
++      const { id, ep, total } = navRef.current;
++      const want = dir > 0 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
++      logLine(`[ep] native step dir=${dir} cur=${ep}/${total} -> ${want || "video"}`);
++      if (want) {
++        setEpMap((m) => ({ ...m, [id]: want }));
++        setPanel(null);
++        return;
++      }
++      goRef.current(dir > 0 ? 1 : -1);
++    };
++    w.__hgNativeTick = (posMs: number, durMs: number, playing: number) => {
++      const t = Math.max(0, (Number(posMs) || 0) / 1000);
++      const d = Math.max(0, (Number(durMs) || 0) / 1000);
++      const { id, ep } = navRef.current;
++      if (d > 0 && Math.abs(d - durRef.current) > 0.4) setDuration(d);
++      setTime(t);
++      setPaused(playing === 0);
++      /* 原生端已經自己跳到續播位置，這條記錄不用再 seek */
++      const r = resumeRef.current;
++      if (r && r.key === `${id}:${ep}`) resumeRef.current = null;
++      saveNativeProgress(id, ep, t, d);
++    };
++    w.__hgNativeEnded = () => {
++      const { id, ep, episodes: eps } = navRef.current;
++      const next = eps.find((e) => e.ep_num === ep + 1);
++      logLine(`[ep] native ended id=${id} ep=${ep} next=${next ? next.ep_num : "-"}`);
++      if (next) {
++        setEpMap((m) => ({ ...m, [id]: next.ep_num }));
++        setPanel(null);
++        return;
++      }
++      /* 沒有下一集：請原生端關掉播放器（會回到列表），不要卡在片尾 */
++      if (!nativeClose()) logLine("[ep] native close unavailable");
++    };
++    return () => {
++      delete w.__hgEpStep;
++      delete w.__hgNativeTick;
++      delete w.__hgNativeEnded;
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  useEffect(() => {
++    setNativeLabel(`第 ${curEp} 集${episodes.length ? ` / ${episodes.length}` : ""}`);
++  }, [curEp, episodes.length]);
++
+   const canStep = (dir: number) => {
+     if (swipeEp && kind === "video") {
+       const ep = epMap[curId] || 1;
+@@ -382,6 +460,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
          case "ArrowDown": e.preventDefault(); stepDir(1); break;
          case "ArrowUp": e.preventDefault(); stepDir(-1); break;
          case " ": e.preventDefault(); videoRef.current?.toggle(); break;
@@ -201,7 +428,7 @@ index 56225d1..a5d5e2e 100644
          case "ArrowLeft": e.preventDefault(); videoRef.current?.seek(Math.max(0, time - 5), "keyboard_shortcut"); break;
          case "ArrowRight": e.preventDefault(); videoRef.current?.seek(time + 5, "keyboard_shortcut"); break;
          case "f": case "F": toggleFull(); break;
-@@ -744,6 +745,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+@@ -744,6 +823,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
  
    return (
      <div
@@ -209,19 +436,86 @@ index 56225d1..a5d5e2e 100644
        className={`hg-player-ui absolute inset-0 overflow-hidden bg-black player-root ${controlsLocked ? "is-locked" : ""} ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${rotated ? "fs-landscape" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
        onPointerMove={() => { if (isDesktop) wake(); }}>
        <div className="absolute inset-0" inert={controlsLocked}>
+@@ -762,8 +842,17 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+               {isActive && playUrl ? (
+                 <div className="absolute inset-0" style={{ touchAction: swipeEp ? "none" : "pan-y" }}
+                   onPointerDown={onDown} onPointerMove={onMove} onPointerUp={(e) => onUp(false, e)} onPointerCancel={(e) => onUp(true, e)} onLostPointerCapture={(e) => onUp(true, e)}>
+-                <div style={{ position: "absolute", inset: 0, transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s})`, transformOrigin: "center center", transition: zoom.g ? "none" : "transform .18s ease-out" }}>
++                {/* zoom 為預設值時不要留 transform：translate3d 會把 video 提升成獨立合成層，
++                    Amazon WebView（Fire TV）在這一層會拿不到解碼後的影像幀 → 有聲無影。 */}
++                <div style={{
++                  position: "absolute", inset: 0,
++                  ...(zoom.x !== 0 || zoom.y !== 0 || zoom.s !== 1
++                    ? { transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s})`, transformOrigin: "center center" }
++                    : null),
++                  transition: zoom.g ? "none" : "transform .18s ease-out",
++                }}>
+                 <VideoSurface ref={videoRef} src={playUrl} poster={posterUrl} autoPlay active={active} muted={muted}
++                  startAt={resumeRef.current && resumeRef.current.key === playKey ? resumeRef.current.t : 0}
+                   diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
+                   volume={volume} rate={effRate}
+                   fit={isDesktop ? "contain" : landscapeVideo ? (fs || vpLandscape ? "contain" : portraitFit) : (vpLandscape ? "contain" : "cover")}
+@@ -819,7 +908,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind
+ 
+               {/* 竖屏下的快捷操作：统一玻璃胶囊组，图标 + 短标签，细分隔线对齐 */}
+               {isActive && !fs && !clean && !isDesktop && (landscapeVideo || zoom.s > 1.05 || episodes.length > 1) && (
+-                <div className="absolute left-1/2 -translate-x-1/2 z-20" style={{ top: "64%" }}>
++                <div className="absolute left-1/2 -translate-x-1/2 z-20" data-tv-hide="1" style={{ top: "64%" }}>
+                   <div className="flex items-center gap-0.5 h-8 px-1 rounded-full backdrop-blur-xl elev-2"
+                     style={{ background: "rgba(12,15,22,.58)", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.09)" }}>
+                     {episodes.length > 1 && (
 diff --git a/src/components/VideoSurface.tsx b/src/components/VideoSurface.tsx
-index a56578e..35d6d12 100644
+index a56578e..248ddbd 100644
 --- a/src/components/VideoSurface.tsx
 +++ b/src/components/VideoSurface.tsx
-@@ -1,6 +1,6 @@
+@@ -1,6 +1,8 @@
  import { useEffect, useImperativeHandle, useRef, forwardRef, useState } from "react";
  import Hls from "hls.js";
 -import { isLocalMedia, platform, playlist } from "../api";
 +import { isLocalMedia, logLine, platform, playlist } from "../api";
++import { NATIVE_MEDIA_ORIGIN, nativePlayUrl, nativePlayerAvailable } from "../tv/bridge";
++import { tvOn } from "../tv/tvMode";
  import { mediaErrorMessage } from "../mediaErrors";
  import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
  import { usePlaybackActivity } from "../usePlaybackActivity";
-@@ -234,7 +234,18 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+@@ -29,6 +31,8 @@ type Props = {
+   /** 换源后重新套用，避免切集时音量/倍速被浏览器重置 */
+   volume?: number;
+   rate?: number;
++  /** 續播起點（秒）：Fire TV 原生播放器用它跳到上次看到的位置 */
++  startAt?: number;
+   onTime?: (t: number) => void;
+   onDuration?: (d: number) => void;
+   onSize?: (w: number, h: number) => void;
+@@ -43,7 +47,7 @@ type Props = {
+ 
+ /** 只负责「播」：hls.js + video 元素，控制条由外层渲染。 */
+ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+-  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain", volume = 1, rate = 1,
++  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain", volume = 1, rate = 1, startAt = 0,
+     onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
+   ref,
+ ) {
+@@ -95,6 +99,18 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
+ 
+     const proxied = isLocalMedia(src);
+     const url = proxied ? src : playlist(src);
++
++    /* Fire TV：Amazon WebView 的硬體解碼只出聲不出影（表面卡在 1 MB），
++       電視版改由原生 ExoPlayer 播放同一個 HLS 代理網址。 */
++    if (tvOn() && nativePlayerAvailable()) {
++      /* 原生播放器接不到 hg.localhost（Tauri 自定義協議），改走 loopback 代理 */
++      const nativeUrl = url.startsWith(NATIVE_MEDIA_ORIGIN) ? url : url.replace(/^https?:\/\/[^/]+/, NATIVE_MEDIA_ORIGIN);
++      logLine(`[play] native url=${nativeUrl.slice(0, 90)} start=${startAt.toFixed(1)}s`);
++      nativePlayUrl(nativeUrl, startAt);
++      setReady(true);
++      return;
++    }
++
+     const useHls = !url.includes("/seg?u=");
+     trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
+ 
+@@ -234,7 +250,59 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
        onPlay={() => { if (activity.isActive()) onPlaying?.(); }}
        onPause={() => onPause?.()}
        onWaiting={() => onWaiting?.()}
@@ -234,6 +528,47 @@ index a56578e..35d6d12 100644
 +          if (v && !(v as unknown as { __audLogged?: boolean }).__audLogged) {
 +            (v as unknown as { __audLogged?: boolean }).__audLogged = true;
 +            logLine(`[aud] ${v.muted ? "muted" : "sound"} vol=${v.volume.toFixed(2)} paused=${v.paused}`);
++            /* 影像診斷：requestVideoFrameCallback 只在「真的拿到影像幀」時觸發。
++               0 幀 = 解碼/表面上游就斷了；有幀但畫面黑 = 合成/渲染層問題。 */
++            const vv = v as unknown as {
++              requestVideoFrameCallback?: (cb: () => void) => void;
++              videoWidth: number; videoHeight: number; readyState: number;
++              error: { code: number } | null;
++            };
++            if (typeof vv.requestVideoFrameCallback === "function") {
++              let n = 0;
++              const t0 = performance.now();
++              const tick = () => {
++                n += 1;
++                const sec = (performance.now() - t0) / 1000;
++                if (n === 1 || n === 30 || n === 90) {
++                  logLine(`[vf] frames=${n} at=${sec.toFixed(1)}s ${vv.videoWidth}x${vv.videoHeight} rs=${vv.readyState}`);
++                }
++                vv.requestVideoFrameCallback!(tick);
++              };
++              vv.requestVideoFrameCallback(tick);
++              setTimeout(() => {
++                if (n === 0) logLine(`[vf] NO-FRAMES-3s ${vv.videoWidth}x${vv.videoHeight} rs=${vv.readyState} err=${vv.error ? vv.error.code : 0}`);
++              }, 3000);
++            } else {
++              logLine("[vf] requestVideoFrameCallback unavailable");
++            }
++            /* 幀有進來但螢幕全黑時，要能回答「影片被誰蓋住 / 在哪裡」 */
++            setTimeout(() => {
++              try {
++                const r = v.getBoundingClientRect();
++                const cs = getComputedStyle(v);
++                const cx = r.left + r.width / 2;
++                const cy = r.top + r.height / 2;
++                const top = document.elementFromPoint(cx, cy) as HTMLElement | null;
++                logLine(
++                  `[vf] rect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)} op=${cs.opacity} vis=${cs.visibility} z=${cs.zIndex} paused=${v.paused} err=${vv.error ? vv.error.code : 0}`
++                );
++                logLine(
++                  `[vf] at-center=${top ? top.tagName + "." + String(top.className || "").slice(0, 70) : "none"}`
++                );
++              } catch { /* ignore */ }
++            }, 4000);
 +          }
 +          onPlaying?.();
 +        }
@@ -264,10 +599,10 @@ index c77ce8d..1c185a1 100644
        <div className={`relative bg-s3 rounded-(--r-lg) elev-3 ${open ? "a-scale-in" : "opacity-0 scale-90 transition-all"}`} style={{ width, maxWidth: "100%" }}>
          {children}
 diff --git a/src/index.css b/src/index.css
-index 9539ea9..cd34550 100644
+index 9539ea9..803e8e1 100644
 --- a/src/index.css
 +++ b/src/index.css
-@@ -558,3 +558,62 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
+@@ -558,3 +558,68 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
  .hg-tabbar button:focus-visible,
  .hg-player-ui button:focus,
  .hg-player-ui button:focus-visible { outline: none; }
@@ -303,11 +638,14 @@ index 9539ea9..cd34550 100644
 +html.tv-mode [tabindex]:focus:not(.tv-focus) { outline: none !important; }
 +
 +/* 焦點移到底部時留出底欄高度，不被遮住 */
-+html.tv-mode .scroll-y { scroll-padding-bottom: 96px; }
++html.tv-mode .scroll-y { scroll-padding-bottom: 96px; min-height: 0; }
 +html.tv-mode .scroll-y > * { scroll-margin-top: 24px; scroll-margin-bottom: 96px; }
 +
 +/* 底欄：電視上按得到、看得清 */
 +html.tv-mode .hg-tabbar > div { height: 64px; }
++
++/* 電視模式：頁籤列置頂（由 MobileShell 以 in-flow 方式渲染，不覆蓋內容） */
++html.tv-mode .hg-tabbar[data-tv-nav] { min-height: 64px; }
 +html.tv-mode .hg-tabbar span { font-size: 17px !important; }
 +
 +/* 手機字級 → 電視字級（只影響電視模式） */
@@ -330,6 +668,9 @@ index 9539ea9..cd34550 100644
 +html.tv-mode .w-\[104px\] { width: 148px; }
 +html.tv-mode .w-\[52px\]  { width: 64px; }
 +html.tv-mode .h-\[68px\]  { height: 84px; }
++
++/* 手機專用的浮動膠囊（切集/铺满/横屏）：電視上會壓在畫面中央，直接隱藏 */
++html.tv-mode [data-tv-hide] { display: none !important; }
 diff --git a/src/pages/Settings.tsx b/src/pages/Settings.tsx
 index 8c99974..70f8b98 100644
 --- a/src/pages/Settings.tsx
@@ -377,7 +718,7 @@ index 8c99974..70f8b98 100644
                <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
              </div>
 diff --git a/src/store.tsx b/src/store.tsx
-index db2b755..b7984d9 100644
+index db2b755..3c2421b 100644
 --- a/src/store.tsx
 +++ b/src/store.tsx
 @@ -72,7 +72,7 @@ type Persist = {
@@ -419,18 +760,43 @@ index db2b755..b7984d9 100644
    } catch {
      return DEFAULTS;
    }
+@@ -263,8 +273,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
+   }, []);
+ 
+   const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); }, []);
++  /* push 需要讀最新的觀看記錄（自動續播），但 setStack 的 updater 拿不到 p，
++     所以用 ref 保存最新一份 persist 狀態。 */
++  const pRef = useRef(p);
++  pRef.current = p;
+   const push = useCallback((pg: PageInput) => {
+-    setStack((s) => [...s, { ...pg, key: `p${++seq}` } as Page]);
++    let page = pg as Page;
++    /* 從列表（分類/搜尋/首頁…）點進來也要續播：只有歷史頁會自己帶 startTime，
++       其餘入口在這裡統一補上，來源是觀看記錄（記住集數與秒數）。
++       片尾 10 秒內或沒有記錄就從頭播。 */
++    if (pg.kind === "feed" && pg.startTime === undefined && pg.videoIds.length) {
++      const id = pg.videoIds[Math.max(0, Math.min(pg.videoIds.length - 1, pg.index))];
++      const h = pRef.current.history.find((x) => x.id === id);
++      if (h && h.t > 3 && (!h.dur || h.t < h.dur - 10)) {
++        page = { ...pg, startEp: h.ep || 1, startTime: h.t } as Page;
++      }
++    }
++    setStack((s) => [...s, { ...page, key: `p${++seq}` } as Page]);
+   }, []);
+   const pop = useCallback(() => setStack((s) => s.slice(0, -1)), []);
+ 
 diff --git a/src/tv/TvMode.tsx b/src/tv/TvMode.tsx
 new file mode 100644
-index 0000000..9436bd1
+index 0000000..057011c
 --- /dev/null
 +++ b/src/tv/TvMode.tsx
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,94 @@
 +import { useEffect, useRef, useState } from "react";
 +import { useStore } from "../store";
 +import { logLine } from "../api";
 +import { installRemoteBridge } from "./bridge";
 +import { armRemoteWatcher, initTvMode, setTvMode, subscribeTv, tvOn } from "./tvMode";
-+import { blurFocus, focusFirst, focusIsAlive, installFocusEngine, playerActive } from "./focus";
++import { blurFocus, focusFirst, focusIsAlive, installFocusEngine, playerActive, reanchor } from "./focus";
 +
 +/** 掛在 App 裡一次：電視模式開關、焦點引擎、換頁後的焦點歸位、預設分頁 */
 +export default function TvMode() {
@@ -484,6 +850,27 @@ index 0000000..9436bd1
 +
 +  useEffect(() => {
 +    if (!on) return undefined;
++    if (playerActive()) return undefined;
++    const el = document.querySelector<HTMLElement>("[data-tv-page]");
++    if (el) { el.scrollTop = 0; }
++    document.scrollingElement?.scrollTo({ top: 0 });
++  }, [on, tab, stack.length]);
++
++  useEffect(() => {
++    if (!on) return undefined;
++    /* 看門狗：React 重繪把節點換掉時高亮框會消失，這裡每 700ms 補回去。
++       播放中不動，避免打斷播放器自己的焦點（進度條/面板）。 */
++    const id = window.setInterval(() => {
++      if (playerActive()) return;
++      if (document.querySelector(".tv-focus")) return;
++      if (reanchor()) return;
++      focusFirst();
++    }, 700);
++    return () => window.clearInterval(id);
++  }, [on]);
++
++  useEffect(() => {
++    if (!on) return undefined;
 +    /* 給設定頁用的手動切換（Settings 直接呼叫 setTvMode） */
 +    (window as unknown as { hgSetTvMode?: (v: boolean) => void }).hgSetTvMode = (v: boolean) => setTvMode(v);
 +    return undefined;
@@ -500,10 +887,10 @@ index 0000000..9436bd1
 +}
 diff --git a/src/tv/bridge.ts b/src/tv/bridge.ts
 new file mode 100644
-index 0000000..fadba60
+index 0000000..f1f9216
 --- /dev/null
 +++ b/src/tv/bridge.ts
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,105 @@
 +/* ============================================================
 +   遙控器原生橋接
 +   ------------------------------------------------------------
@@ -532,12 +919,89 @@ index 0000000..fadba60
 +    return "handled";
 +  };
 +}
++
++
++type NativePlayer = {
++  play: (url: string, startMs: number) => void;
++  load?: (url: string, label: string | null, startMs: number) => void;
++  close?: () => void;
++};
++
++/** 原生播放器（ExoPlayer）是否可用：Fire TV 的 Amazon WebView 解不出畫面時走這條 */
++export function nativePlayerAvailable(): boolean {
++  const b = (window as unknown as { HGPlayer?: NativePlayer }).HGPlayer;
++  if (!b || typeof b.play !== "function") return false;
++  /* 只在 Fire TV（Amazon WebView）強制走原生：它的硬體解碼路徑只出聲不出影。
++     其他電視盒（Google TV Streamer 等）WebView 播放正常，保留原本的播放器 UI
++     （詳情/選集/評論面板都在 WebView 裡）。
++     HGEnv.forceNative() 只在 adb 帶 --ez forceNative true 時為 true，
++     用來在模擬器上驗證原生播放器路徑。 */
++  const force = (window as unknown as { HGEnv?: { forceNative?: () => boolean } }).HGEnv;
++  if (force && typeof force.forceNative === "function") {
++    try { if (force.forceNative()) return true; } catch { /* ignore */ }
++  }
++  return /AmazonWebView|AFT[A-Z]/i.test(navigator.userAgent);
++}
++
++/** Rust 端 loopback 代理（src-tauri/src/linux_http.rs 的 ORIGIN），
++ *  電視版原生播放器只認真的 http://，Tauri 自定義協議它拿不到。 */
++export const NATIVE_MEDIA_ORIGIN = "http://127.0.0.1:17650";
++
++/** 原生播放器是否已經開著（開著就一直用 load 原地換集，不要疊第二個 Activity） */
++let launched = false;
++let epLabel = "";
++
++/** 播放器上要顯示的集數標籤（原生播放器用 Toast 顯示） */
++export function setNativeLabel(label: string) {
++  epLabel = label;
++}
++
++/** 原生播放器關掉後由 MainActivity 標記，避免重複 startActivity */
++export function nativeClosed() {
++  launched = false;
++}
++
++/**
++ * @param startSec 續播起點（秒）。原生端等 STATE_READY 才 seek，
++ *                 所以剛進去就先播 0 秒再跳，不會被 prepare 蓋掉。
++ */
++export function nativePlayUrl(url: string, startSec = 0): boolean {
++  const b = (window as unknown as { HGPlayer?: NativePlayer }).HGPlayer;
++  if (!b) return false;
++  const startMs = Math.max(0, Math.round((Number.isFinite(startSec) ? startSec : 0) * 1000));
++  try {
++    if (launched && typeof b.load === "function") b.load(url, epLabel, startMs);
++    else {
++      b.play(url, startMs);
++      launched = true;
++    }
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** 播完且前端確認沒有下一集：關掉原生播放器（會回到 WebView 上一層） */
++export function nativeClose(): boolean {
++  const b = (window as unknown as { HGPlayer?: NativePlayer }).HGPlayer;
++  if (!b || typeof b.close !== "function") return false;
++  try { b.close(); return true; } catch { return false; }
++}
++
++/* 原生播放器關閉後（MainActivity.onResume）回到 WebView：等同按一次返回鍵 */
++(window as unknown as { __hgNativeClosed?: () => void }).__hgNativeClosed = () => {
++  nativeClosed();
++  window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
++};
++
++/** @deprecated 用 nativePlayUrl（會判斷是否已在播放中） */
++export const nativePlay = nativePlayUrl;
 diff --git a/src/tv/focus.ts b/src/tv/focus.ts
 new file mode 100644
-index 0000000..48044aa
+index 0000000..0b5c74a
 --- /dev/null
 +++ b/src/tv/focus.ts
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,306 @@
 +/* ============================================================
 +   遙控器焦點引擎
 +   ------------------------------------------------------------
@@ -586,6 +1050,20 @@ index 0000000..48044aa
 +  return true;
 +}
 +
++/**
++ * 候選範圍：彈層 > 最上層堆疊頁 > 整份文件。
++ * 堆疊頁（分類 / 排行榜…）是「蓋在原本那頁之上」的 z-30 容器，下面那頁沒有被
++ * display:none / visibility:hidden，所以整份文件一起找的話，焦點會跑到背後那頁
++ * ——遙控器看起來就是「往下按一下，高亮框就不見了」（框其實在下面那頁的 banner 上）。
++ */
++export function activeScope(): ParentNode {
++  const overlay = document.querySelector<HTMLElement>("[data-tv-overlay]");
++  if (overlay) return overlay;
++  const pages = document.querySelectorAll<HTMLElement>("[data-tv-page]");
++  if (pages.length) return pages[pages.length - 1];
++  return document;
++}
++
 +export function tvCandidates(root: ParentNode): HTMLElement[] {
 +  const out: HTMLElement[] = [];
 +  root.querySelectorAll<HTMLElement>(SEL).forEach((el) => {
@@ -607,13 +1085,27 @@ index 0000000..48044aa
 +    if (el === cur || cur.contains(el) || el.contains(cur)) continue;
 +    if (el === cur.parentElement) continue;
 +    const r = el.getBoundingClientRect();
++    /* 垂直移動時，整塊在畫面左右之外的（橫向列的離屏卡片）不要選：
++       scrollIntoView 對 transform 輪播沒用，選到就是「框跑到看不見的地方」。 */
++    if (vertical && (r.right <= 0 || r.left >= window.innerWidth)) continue;
 +    const dx = r.left + r.width / 2 - cx;
 +    const dy = r.top + r.height / 2 - cy;
++    /* 底部頁籤列（首頁/搜索/分類/我的）不搶內容區的「往下」：
++       內容最後一列按 DOWN 直接跳到頁籤列，使用者會覺得焦點莫名跑掉。
++       要切分頁用數字鍵（1-4），或在頁籤列上左右移動。 */
++    if (dir === "down" && !cur.closest("[data-tv-nav]") && el.closest("[data-tv-nav]")) continue;
++
 +    const primary = vertical ? dy : dx;
-+    if (dir === "down" && primary <= 2) continue;
-+    if (dir === "up" && primary >= -2) continue;
-+    if (dir === "right" && primary <= 2) continue;
-+    if (dir === "left" && primary >= -2) continue;
++    /* 最小間距：網格裡左右兩欄常差幾像素，用固定 2px 判斷會把「隔壁欄同一列」
++       當成「下面那一個」（往下按卻往右跑）。改成跟元素尺寸成比例。 */
++    const gap = Math.max(6, Math.round(0.35 * Math.min(
++      vertical ? c.height : c.width,
++      vertical ? r.height : r.width,
++    )));
++    if (dir === "down" && primary <= gap) continue;
++    if (dir === "up" && primary >= -gap) continue;
++    if (dir === "right" && primary <= gap) continue;
++    if (dir === "left" && primary >= -gap) continue;
 +
 +    /* 垂直移動時看水平重疊、水平移動時看垂直重疊：
 +       重疊的候選（同一欄 / 同一列）優先，否則依偏移量加重懲罰。 */
@@ -636,27 +1128,71 @@ index 0000000..48044aa
 +  return `x=${Math.round(r.left)} y=${Math.round(r.top)} w=${Math.round(r.width)} h=${Math.round(r.height)} "${label}"`;
 +}
 +
++let lastKey = "";
++
++function keyOf(el: HTMLElement): string {
++  return (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
++}
++
++/**
++ * 把元素捲進可視範圍。
++ * scrollIntoView 在某些版面（flex 子項沒有 min-height:0、外層 overflow:hidden）
++ * 會完全不動，遙控器看起來就是「焦點移到下面但畫面不捲」。這裡直接對
++ * 最近的可捲動祖先改 scrollTop，是最可靠的一招。
++ */
++function ensureInView(el: HTMLElement) {
++  const vh = window.innerHeight;
++  let r = el.getBoundingClientRect();
++  if (r.top >= 0 && r.bottom <= vh) return;
++  let p: HTMLElement | null = el.parentElement;
++  while (p) {
++    const cs = getComputedStyle(p);
++    const scrollable = /auto|scroll/.test(cs.overflowY) && p.scrollHeight > p.clientHeight + 4;
++    if (scrollable) {
++      const pr = p.getBoundingClientRect();
++      const box = el.getBoundingClientRect();
++      if (box.top < pr.top + 8) p.scrollTop += box.top - pr.top - 16;
++      else if (box.bottom > pr.bottom - 8) p.scrollTop += box.bottom - pr.bottom + 16;
++      return;
++    }
++    p = p.parentElement;
++  }
++  /* 沒有可捲動祖先 → 退回視窗捲動 */
++  r = el.getBoundingClientRect();
++  if (r.top < 0) window.scrollBy(0, r.top - 16);
++  else if (r.bottom > vh) window.scrollBy(0, r.bottom - vh + 16);
++}
++
 +export function focusEl(el: HTMLElement, scroll = true) {
 +  if (lastFocused && lastFocused !== el) lastFocused.classList.remove("tv-focus");
 +  lastFocused = el;
++  lastKey = keyOf(el);
 +  el.classList.add("tv-focus");
 +  try { el.focus({ preventScroll: true }); } catch { /* ignore */ }
 +  if (scroll) {
 +    try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch { /* ignore */ }
++    ensureInView(el);
 +  }
 +  /* 遙控器沒有滑鼠，出問題時只能靠這行日誌重建「焦點跑去哪」 */
 +  if (tvOn()) logLine(`[tv] focus ${describe(el)}`);
++  /* 安全網：焦點落在畫面外＝使用者眼中「高亮框不見了」，一定要留下證據 */
++  const rr = el.getBoundingClientRect();
++  if (tvOn() && (rr.right <= 0 || rr.left >= window.innerWidth || rr.bottom <= 0 || rr.top >= window.innerHeight)) {
++    logLine(`[tv] offscreen! vw=${window.innerWidth}x${window.innerHeight} ${describe(el)}`);
++  }
 +}
 +
 +/** 把焦點放到畫面上第一個合理的元素（分頁切換、載入完成後呼叫） */
 +export function focusFirst(root?: ParentNode): boolean {
-+  const scope: ParentNode = root || (document.querySelector<HTMLElement>("[data-tv-overlay]") || document);
++  const scope: ParentNode = root || activeScope();
 +  const all = tvCandidates(scope);
 +  if (!all.length) return false;
 +  /* 文字框放最後：電視上沒有輸入法，先把焦點給可點的內容，
 +     使用者真的要走搜尋再自己往上一格。 */
 +  const list = all.filter((el) => !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
-+  const pool = list.length ? list : all;
++  /* 頁籤列在電視模式是置頂的，幾何上最靠上 —— 但它不該是「進頁面後的第一個焦點」 */
++  const content = list.filter((el) => !el.closest("[data-tv-nav]"));
++  const pool = content.length ? content : (list.length ? list : all);
 +  /* 取「最靠上、同高時最靠左」的一個，而不是 DOM 第一個 ——
 +     DOM 順序在瀑布流 / 橫向列表裡常常不是視覺順序。 */
 +  let best = pool[0];
@@ -666,6 +1202,24 @@ index 0000000..48044aa
 +    if (r.top < br.top - 8 || (Math.abs(r.top - br.top) <= 8 && r.left < br.left)) best = el;
 +  }
 +  focusEl(best);
++  return true;
++}
++
++/**
++ * 瀑布流 / 横向列表重繪時，原本那個節點會被 React 換掉，
++ * `.tv-focus` 跟著消失 —— 遙控器看起來就是「高亮框移動一下就整個不見」。
++ * 這裡用焦點文字當識別，把高亮框接回同一個邏輯元素。
++ */
++export function reanchor(): boolean {
++  if (lastFocused && lastFocused.isConnected && lastFocused.classList.contains("tv-focus")) return true;
++  if (!lastKey) return false;
++  const hit = tvCandidates(activeScope()).find((el) => {
++    if (keyOf(el) !== lastKey) return false;
++    const r = el.getBoundingClientRect();
++    return r.width > 0 && r.height > 0;
++  });
++  if (!hit) return false;
++  focusEl(hit, true);
 +  return true;
 +}
 +
@@ -725,7 +1279,7 @@ index 0000000..48044aa
 +  if (!dir) return;
 +  if (typing && (dir === "left" || dir === "right")) return; // 輸入框內移動游標
 +
-+  const scope: ParentNode = overlay || document;
++  const scope: ParentNode = overlay || activeScope();
 +  const list = tvCandidates(scope);
 +  if (!list.length) return;
 +
@@ -756,10 +1310,10 @@ index 0000000..48044aa
 +}
 diff --git a/src/tv/tvMode.ts b/src/tv/tvMode.ts
 new file mode 100644
-index 0000000..ae1f841
+index 0000000..f995ffc
 --- /dev/null
 +++ b/src/tv/tvMode.ts
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,80 @@
 +/* ============================================================
 +   電視模式（Android TV / 電視盒）
 +   ------------------------------------------------------------
@@ -787,7 +1341,11 @@ index 0000000..ae1f841
 +function autoDetect(): boolean {
 +  if (!isAndroid) return false;
 +  try {
-+    if (!/Mobile/i.test(navigator.userAgent)) return true;
++    const ua = navigator.userAgent;
++    /* Fire TV 的 UA 帶 "Mobile"，光看 Mobile 會誤判成手機；
++       認得裝置系列名比較可靠。 */
++    if (/AFT[A-Z]|AmazonWebView|Amazon ?Fire|BRAVIA|Google ?TV|Android ?TV/i.test(ua)) return true;
++    if (!/Mobile/i.test(ua)) return true;
 +    const w = Math.max(window.screen?.width || 0, window.screen?.height || 0);
 +    return w >= 900;
 +  } catch {

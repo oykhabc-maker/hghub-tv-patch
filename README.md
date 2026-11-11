@@ -1,7 +1,9 @@
 # HGhub TV Patch — 讓 HGhub 在 Android TV / 電視盒上用遙控器操作
 
 把 [HGhub](https://github.com/zxsos/HGhub)（黃果短劇第三方客戶端，Tauri 2 + Rust/React）改成
-**遙控器可操作**的電視版：方向鍵移動焦點、OK 進入、返回鍵分層、開機帶聲。
+**遙控器可操作**的電視版：方向鍵移動焦點、OK 進入、返回鍵分層、開機帶聲，
+Fire TV 上改用原生 ExoPlayer 播放（繞過 Amazon WebView 有聲無影的解碼缺陷），
+並補上**播完自動接下一集**與**跨進入的續播**。
 
 > ⚠️ **這個 repo 只放補丁，不含上游完整原始碼。**
 > 上游是 **PolyForm Noncommercial 1.0.0** 授權，本補丁同樣受其約束：**禁止任何商業用途**。
@@ -11,13 +13,17 @@
 | --- | --- |
 | ![分類](docs/tv-category.jpg) | ![播放](docs/tv-player.jpg) |
 
+> 上圖為 tv1 版本；tv31 起電視模式**不再顯示上下頁籤列**（切分頁改用遙控器數字鍵 1-4）。
+
 ## 內容
 
 ```
-hghub-tv-tv1.diff      # 13 個檔案的源碼差異（可 git apply，不含 android-tv/）
+hghub-tv-tv31.diff     # 15 個檔案的源碼差異（可 git apply，不含 android-tv/）
 android-tv/            # 原生覆蓋層：gen/android 被 gitignore，需在 tauri init 後套用
-  ├── MainActivity.kt  #   DPAD 橋接 + 允許帶聲自動播放
-  ├── apply.mjs        #   一鍵套用（含 manifest banner、applicationId）
+  ├── MainActivity.kt  #   DPAD 橋接、允許帶聲自動播放、HGPlayer/HGEnv JS 介面
+  ├── PlayerActivity.kt#   Fire TV 原生播放器（Media3/ExoPlayer）、每秒回報播放位置
+  ├── apply.mjs        #   一鍵套用（含 manifest banner、PlayerActivity、Media3 依賴、applicationId）
+  ├── network_security_config.xml  # 只放行 127.0.0.1 明文（原生播放器讀 loopback 代理）
   ├── tv_banner.png    #   320×180 Android TV banner
   └── README.md
 TV-REMOTE.md           # 改動說明、遙控器操作對照、真機踩到的坑
@@ -27,22 +33,23 @@ LICENSE                # PolyForm Noncommercial 1.0.0（含 Required Notice）
 ## 套用
 
 基準 commit：`2c55dfe`（feat(feed): 桌面端切集开关生效…）。上游持續更新，若 `git apply` 有衝突，
-用 `git apply -3` 走三方合併，或把 `src/tv/` 與 5 個既有檔的改動手動搬過去（改動很集中）。
+用 `git apply -3` 走三方合併，或把 `src/tv/` 與既有檔的改動手動搬過去（改動很集中）。
 
 ```bash
 git clone https://github.com/zxsos/HGhub.git hghub-tv
 cd hghub-tv
 git checkout 2c55dfe
-git apply /path/to/hghub-tv-tv1.diff
+git apply /path/to/hghub-tv-tv31.diff
+cp -a /path/to/android-tv .
 
 pnpm install
 pnpm tauri android init --ci
-node android-tv/apply.mjs        # 套原生改動（DPAD 橋接、TV banner、applicationId）
+node android-tv/apply.mjs        # 套原生改動（DPAD 橋接、原生播放器、TV banner、applicationId）
 
 # 交付給電視盒：arm64 + armv7 通用包
 pnpm tauri android build --target aarch64 --target armv7 --apk
 
-# 模擬器除錯：x86_64
+# 模擬器除錯：x86_64（要驗原生播放器路徑可加 --ez forceNative true 啟動）
 pnpm tauri android build --target x86_64 --debug --apk
 ```
 
@@ -65,12 +72,23 @@ apksigner sign --ks ~/.android/debug.keystore --ks-key-alias androiddebugkey \
    `window.__tvKey(code)`，前端再合成一次 keydown，焦點引擎與播放器就都走同一條路。
 3. **返回鍵階層**：面板 → 彈窗 → 頁面堆疊 → 回瀏覽頁 → 連按兩次才退出（第一次只提示），
    避免手滑直接掉回桌面。
-4. **電視 UI**：字級與卡片放大、底欄 64px、單一黃色焦點框（`::after` + inset box-shadow，
+4. **電視 UI**：字級與卡片放大、單一黃色焦點框（`::after` + inset box-shadow，
    用 `outline` 會被 `overflow:hidden` 的橫向捲動列裁掉）、320×180 TV banner、
-   獨立 `applicationId` 以便與官方版並存。
+   獨立 `applicationId` 以便與官方版並存。tv31 起**上下頁籤列都不畫**，內容滿版。
 5. **開機帶聲**：上游 `muteOnStartup` 預設 `true`，這裡改預設不靜音，並用
    `hghub_unmute_v1` 做一次性遷移（舊安裝也會改過來），之後尊重使用者設定；
    另設 `mediaPlaybackRequiresUserGesture = false`，避免 Chromium 把自動播放的影片消音。
+6. **Fire TV 原生播放器** `android-tv/PlayerActivity.kt`：Amazon WebView 138 會跟 MediaCodec
+   要 6.2 MB 的影像表面，但 AWV 卡在 1 MB（`failed to set min buffer size … 1048576`），
+   結果是解碼器有幀、`requestVideoFrameCallback` 在跳、螢幕全黑。改由 ExoPlayer 播同一個
+   Rust HLS 代理網址（`http://127.0.0.1:17650/hls?u=…`），鑑權與分片改寫完全不用重做。
+7. **播放狀態回傳（tv31）**：原生播放器每秒回報 `__hgNativeTick(pos, dur, playing)`，
+   播完先問前端 `__hgNativeEnded()`——有下一集就原地換源、沒有才關播放器。WebView 端
+   據此寫觀看記錄、自動續播（`play/load` 帶 `startMs`，等 `STATE_READY` 才 seek），
+   電視上原本「進度永遠 0、播完掉回列表、按上下鍵沒反應」三個問題一起修掉。
+8. **遙控器切集不受開關影響**：`swipeEp`（上下划切集）原本只管手機手勢，但電視上下鍵
+   誤用了同一條判斷，關掉開關時按上下鍵只會在背景列表捲動。tv31 起播放中的上下鍵
+   一律先切集，沒有下一集才切上一／下一部劇。
 
 ## 遙控器操作
 
@@ -78,23 +96,27 @@ apksigner sign --ks ~/.android/debug.keystore --ks-key-alias androiddebugkey \
 | --- | --- |
 | ↑ ↓ ← → | 移動焦點（幾何最近鄰，含捲動） |
 | OK | 進入 / 播放暫停 |
-| 播放中 ↑ ↓ | 切上一集／下一集 |
-| 播放中 ← → | −5 秒／+5 秒 |
+| 播放中 ↑ ↓ | 切上一集／下一集（原生活播放器裡一律切集） |
+| 播放中 ← → | −15 秒／+15 秒（ExoPlayer 預設 seek 量） |
 | 返回 | 上一層；根頁連按兩下退出 |
-| 1 / 2 / 3 / 4 | 首頁 / 搜索 / 分類 / 我的 |
+| 1 / 2 / 3 / 4 | 首頁 / 搜索 / 分類 / 我的（電視模式沒有頁籤列，靠這組鍵） |
 
 ## 驗證環境
 
 | 裝置 | 系統 | 結果 |
 | --- | --- | --- |
-| Google TV Streamer | Android 14（32-bit userspace, armeabi-v7a） | 導覽／播放／切集／返回／帶聲全部實測通過 |
-| Fire TV Stick 4K Max (`AFTKA`) | Fire OS 9（armeabi-v7a） | 已安裝，遙控器走同一條原生橋接 |
-| Android TV 36 模擬器 | x86_64, 1920×1080 | 開發期逐項驗證（焦點日誌 `[tv] focus x= y= w= h=`） |
+| Fire TV Stick 4K Max (`AFTKA`) | Fire OS 9（armeabi-v7a） | tv31 實測：上下鍵切集、播完自動接下一集、最後一集播完自動關閉、跳出再進從上次位置續播 |
+| Google TV Streamer | Android 14（32-bit userspace, armeabi-v7a） | 導覽／播放／切集／返回／帶聲全部實測通過（WebView 播放器路徑） |
+| Android TV 36 模擬器 | x86_64, 1920×1080 | 開發期逐項驗證（`--ez forceNative true` 可強制走原生播放器路徑） |
+
+除錯日誌：`adb logcat -s HGTV`，可看到 `[tv] focus x= y= w= h=`、`[play] native url=… start=`
+（`start` 就是續播起點）、`[ep] native step/ended`。
 
 ## 已知限制
 
 - 搜索頁打字仍需輸入法；遙控器可用「熱門題材」或搜尋歷史代替。
 - 播放器的詳情／評論／選集面板尚無遙控器入口（上下鍵已能切集）。
+- 電視模式沒有頁籤列，只能靠數字鍵 1-4 切分頁。
 
 ## 授權
 
