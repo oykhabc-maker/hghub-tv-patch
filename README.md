@@ -9,6 +9,9 @@ Fire TV 上改用原生 ExoPlayer 播放（繞過 Amazon WebView 有聲無影的
 > 上游是 **PolyForm Noncommercial 1.0.0** 授權，本補丁同樣受其約束：**禁止任何商業用途**。
 > 與上游作者無關，非官方改造。若上游或權利方要求，會立即下架。
 
+🔗 **完整原始碼（已套用本補丁的電視版）**：<https://github.com/oykhabc-maker/HGhub/tree/tv31>
+（分支 `tv31`，基於上游 `2c55dfe`；上游主線已到 1.2.19，尚未 rebase）
+
 | 首頁（分類） | 播放中 |
 | --- | --- |
 | ![分類](docs/tv-category.jpg) | ![播放](docs/tv-player.jpg) |
